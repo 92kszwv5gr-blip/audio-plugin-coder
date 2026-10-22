@@ -39,3 +39,5 @@ Fictional names only. Never use a real manufacturer or product name.
 - `?render` means no rAF loop. Otherwise loop with rAF and honour `prefers-reduced-motion` (show a still).
 - Text >= 20 px in stage units. Nothing flashes more than 3 times per second.
 - Light is fixed to the world: only knurl and indicator rotate; glass and specular stay put.
+- URL params are untrusted: clamp every number, cap text length, and draw text only with `fillText` (never `innerHTML`). See `references/security-review.md`.
+- For any public EU page, self-host the fonts instead of linking Google Fonts (GDPR; see security-review #3).

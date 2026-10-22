@@ -22,8 +22,8 @@ Everything is precomputed at load on a fixed **1/240 s** grid. `seek(t)` only in
 - Calibration: accent peak = −1.5 dBFS (first red lit, top red rare). Normal hits peak around −4.4 dBFS.
 - Segment brightness is ramped over 1.2 dB, so a segment fades rather than snapping.
 
-## Flash budget (< 3 Hz)
-- With the default pattern, the hit rate is 6 per 2.14 s bar, about 2.8 per second, so the top segments toggle below 3 Hz.
+## Flash budget (≤ 3 flashes in any 1 s window)
+- **Correction (security review v1):** the average hit rate of 2.8/s does **not** guarantee ≤ 3 flashes per second. Steps 7, 9, 11 and 14 land 4 hits inside 0.94 s, and the falling peak-hold dot adds one more. The measured worst case is 5 flashes in 1 s (ladder segment 9). `check-frames.cjs` now measures this; see `security-review.md` #2.
 - Step-LED chase: each LED lights once per bar and decays over 90 ms. Never make a whole row blink together.
 - The display shows no per-step counter; text that changes at 7.5 Hz reads as flicker.
 

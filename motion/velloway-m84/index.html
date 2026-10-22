@@ -24,17 +24,21 @@
 // Every input has a default; URL params override (?maker=&model=&preset=&bpm=&steps=&accents=&len=&seed=).
 const Q = new URLSearchParams(location.search);
 const RENDER = Q.has('render');
-const list = (s, d) => (s || d).split(',').map(Number).filter(n => n >= 1 && n <= 16);
+// Params are untrusted (anyone can craft a link): text is length-capped and only ever drawn with fillText,
+// numbers are clamped so a link can't make the precompute allocate or loop without bound.
+const list = (s, d) => [...new Set((s || d).split(',').slice(0, 16).map(Number).filter(n => Number.isInteger(n) && n >= 1 && n <= 16))];
+const txt = (s, d, max) => (s || d).replace(/[^\x20-\x7E]/g, '').slice(0, max).toUpperCase() || d;
+const num = (s, d, lo, hi) => { const v = Number(s); return s !== null && Number.isFinite(v) ? Math.min(hi, Math.max(lo, v)) : d; };
 const CFG = {
-  maker:   (Q.get('maker')  || 'VELLOWAY').toUpperCase(),
-  model:   (Q.get('model')  || 'M-84').toUpperCase(),
-  kind:    (Q.get('kind')   || 'MONOSYNTH').toUpperCase(),
-  preset:  (Q.get('preset') || '07 COPPER DUSK').toUpperCase(),
-  bpm:     +Q.get('bpm') || 112,
+  maker:   txt(Q.get('maker'),  'VELLOWAY', 12),
+  model:   txt(Q.get('model'),  'M-84', 10),
+  kind:    txt(Q.get('kind'),   'MONOSYNTH', 14),
+  preset:  txt(Q.get('preset'), '07 COPPER DUSK', 14),
+  bpm:     num(Q.get('bpm'), 112, 60, 180),
   active:  list(Q.get('steps'), '1,4,7,9,11,14'),
   accents: list(Q.get('accents'), '1,9'),
-  length:  +Q.get('len') || 10,
-  seed:    +Q.get('seed') || 84,
+  length:  num(Q.get('len'), 10, 10, 60),
+  seed:    Math.floor(num(Q.get('seed'), 84, 1, 2147483647)),
 };
 
 /* ---------------------------------------------------------------- timeline */
@@ -580,14 +584,16 @@ function drawVU(v, pos, warm) {
   ctx.restore();
 }
 
+function ladderSegs(db, pk) {
+  let pkSeg = -1; for (let i = 0; i < LAD_TH.length; i++) if (pk >= LAD_TH[i]) pkSeg = i;
+  return LAD_TH.map((th, i) => { const on = clamp((db - th) / 1.2 + 1, 0, 1); return i === pkSeg && pkSeg > 0 ? Math.max(on, 0.9) : on; });
+}
 function drawLadder(L, db, pk) {
-  const segs = LAD_TH.length;
-  let pkSeg = -1; for (let i = 0; i < segs; i++) if (pk >= LAD_TH[i]) pkSeg = i;
+  const segs = LAD_TH.length, lit = ladderSegs(db, pk);
   for (let i = 0; i < segs; i++) {
     const y = LAD.y + LAD.h - 4 - (i + 1) * LAD.pitch + (LAD.pitch - LAD.segH), x = L.x + 6, w = LAD.w - 12;
     const [r, g, b] = LAD_COL(i);
-    let on = clamp((db - LAD_TH[i]) / 1.2 + 1, 0, 1);
-    if (i === pkSeg && pkSeg > 0) on = Math.max(on, 0.9);
+    const on = lit[i];
     ctx.fillStyle = `rgba(${r},${g},${b},0.14)`; ctx.fillRect(x, y, w, LAD.segH);
     if (on > 0.01) {
       ctx.save(); ctx.globalAlpha = on;
@@ -740,6 +746,8 @@ window.__probe = t => {
     t, needleL: read(NEEDLE_L, t), needleR: read(NEEDLE_R, t), vuZero: VU_POS(0),
     ladL: read(LAD_L, t), pkL: read(PK_L, t), cutoffDeg: knobAngle('cutoff', t), cutoffHz: cutoffHz(t),
     zoom: camera(t).z, playing: t >= 1.0 && t < STOP,
+    ladSegsL: ladderSegs(read(LAD_L, t), read(PK_L, t)),
+    stepLeds: Array.from({ length: 16 }, (_, j) => Math.max(stepLed(j, t), CFG.active.includes(j + 1) && t >= 1.2 ? 0.3 : 0)),
   };
 };
 window.TIMELINE = { DUR, START, STEP, BAR, BARS, LAST, STOP, C0, P0, P1, P2, OMEGA, ZETA };

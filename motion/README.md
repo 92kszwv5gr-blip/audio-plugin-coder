@@ -29,5 +29,9 @@ URL params: `maker`, `model`, `kind`, `preset`, `bpm`, `steps`, `accents`, `len`
 - Audio track: the piece is silent. A matching render from the same hit list (WebAudio offline → WAV, then muxed) is the natural next step. [not built]
 - BPM other than 112 keeps the gesture times fixed relative to the last hit. Lengths under 10 s need the story re-planned.
 
+- **Flash budget (open):** the ladders reach 5 flashes in one 1 s window (WCAG-style count). Under WCAG 2.3.1 this is likely a pass on area, but it fails the brief's stricter rule. Options: (A) keep as-is; (B) add a ~450 ms LED afterglow, which is softer and passes the strict rule; (C) thin the pattern so no 1 s window holds 4 hits.
+- See `.claude/skills/motion/references/security-review.md` for the full review.
+
 ## History
+- v1.1 (2026-10-22): security review. URL params clamped (fixes the tab freeze), flash-budget check added to QA.
 - v1 (2026-10-22): VELLOWAY M-84 reference build, `/motion` skill, QA/render/artifact pipeline.

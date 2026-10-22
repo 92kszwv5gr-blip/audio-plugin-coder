@@ -72,6 +72,27 @@ fs.mkdirSync(outDir, { recursive: true });
     check('needle never jumps', maxStep < 0.03, `max d(pos) per 1/480 s = ${maxStep.toFixed(4)} at ${at.toFixed(3)} s`);
     const peak = Math.max(...probe.map(p => p.needleL));
     check('needles kiss 0 VU', Math.abs(peak - probe[0].vuZero) < 0.02, `peak pos ${peak.toFixed(3)} vs 0 VU ${probe[0].vuZero.toFixed(3)}`);
+    // Flash budget (WCAG 2.3.1 style): per light element, count rises of >= 0.5 brightness that follow a
+    // drop of >= 0.5, then take the most in any 1 s sliding window. Must stay <= 3.
+    if (probe[0].ladSegsL) {
+      const series = [];
+      probe[0].ladSegsL.forEach((_, i) => series.push({ name: `ladder seg ${i + 1}`, v: probe.map(p => p.ladSegsL[i]) }));
+      probe[0].stepLeds.forEach((_, i) => series.push({ name: `step LED ${i + 1}`, v: probe.map(p => p.stepLeds[i]) }));
+      let worst = { n: 0, name: '-', at: 0 };
+      for (const s of series) {
+        const flashes = []; let lo = s.v[0], hi = s.v[0], dropped = false;
+        for (let i = 1; i < s.v.length; i++) {
+          const v = s.v[i];
+          if (!dropped) { hi = Math.max(hi, v); if (hi - v >= 0.5) { dropped = true; lo = v; } }
+          else { lo = Math.min(lo, v); if (v - lo >= 0.5) { flashes.push(i / 480); dropped = false; hi = v; } }
+        }
+        for (let a = 0; a < flashes.length; a++) {
+          let b = a; while (b < flashes.length && flashes[b] - flashes[a] < 1.0) b++;
+          if (b - a > worst.n) worst = { n: b - a, name: s.name, at: flashes[a] };
+        }
+      }
+      check('no element flashes > 3x in any 1 s', worst.n <= 3, `worst: ${worst.name}, ${worst.n} flashes from ${worst.at.toFixed(2)} s`);
+    }
     const tail = probe.filter(p => p.t >= dur - 1.0);
     check('meters at rest during hold', tail.every(p => p.needleL < 0.02 && p.ladL < -40), `needle ${tail[0].needleL.toFixed(3)}, ladder ${tail[0].ladL.toFixed(1)} dB`);
   }

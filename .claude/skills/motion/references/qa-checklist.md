@@ -12,6 +12,8 @@ Run `bash scripts/motion/motion.sh check <index.html>`. It produces `frame-00..N
 - [ ] Accent needle peak at 0 VU (±0.02)
 - [ ] Meters at rest through the final 1 s hold
 - [ ] No page/console errors
+- [ ] Flash budget: no ladder segment or step LED flashes more than 3 times in any 1 s window
+- [ ] Hostile params load fast: `?len=1e9`, `?bpm=0.001`, `?preset=<img src=x onerror=alert(1)>` (see `security-review.md`)
 
 ## By eye, per frame
 - [ ] No overlaps: tooltip over controls, labels on ticks, VU numbers touching each other
