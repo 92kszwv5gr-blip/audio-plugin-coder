@@ -1,0 +1,763 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>VELLOWAY M-84</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Michroma&family=Saira+Semi+Condensed:wght@600&family=VT323&display=swap">
+<style>
+  /* One 1920x1080 stage drawn to a full-window canvas; desk colour fills the letterbox. */
+  :root { --desk: #16120E; color-scheme: dark; }
+  html, body { height: 100%; margin: 0; background: var(--desk); overflow: hidden; }
+  canvas { display: block; width: 100%; height: 100%; }
+</style>
+</head>
+<body>
+<canvas id="stage" role="img" aria-label="Animated hardware-style monosynth plugin playing a 16-step pattern: knobs turn, VU needles swing and LED meters bounce."></canvas>
+<script>
+(async function () {
+'use strict';
+
+/* ------------------------------------------------------------------ config */
+// Every input has a default; URL params override (?maker=&model=&preset=&bpm=&steps=&accents=&len=&seed=).
+const Q = new URLSearchParams(location.search);
+const RENDER = Q.has('render');
+const list = (s, d) => (s || d).split(',').map(Number).filter(n => n >= 1 && n <= 16);
+const CFG = {
+  maker:   (Q.get('maker')  || 'VELLOWAY').toUpperCase(),
+  model:   (Q.get('model')  || 'M-84').toUpperCase(),
+  kind:    (Q.get('kind')   || 'MONOSYNTH').toUpperCase(),
+  preset:  (Q.get('preset') || '07 COPPER DUSK').toUpperCase(),
+  bpm:     +Q.get('bpm') || 112,
+  active:  list(Q.get('steps'), '1,4,7,9,11,14'),
+  accents: list(Q.get('accents'), '1,9'),
+  length:  +Q.get('len') || 10,
+  seed:    +Q.get('seed') || 84,
+};
+
+/* ---------------------------------------------------------------- timeline */
+const STEP = 60 / CFG.bpm / 4;            // 0.1339 s at 112 BPM
+const BAR = STEP * 16;
+const START = 1.47;                        // downbeat of bar 1
+// Default story is 3 bars; other lengths add or remove whole bars (min 3), keeping >= 2.1 s after the last hit.
+const BARS = Math.max(3, Math.floor((CFG.length - 2.1 - START) / BAR + 0.01));
+const LAST = START + BARS * BAR;           // final downbeat hit (7.90 s by default)
+const STOP = LAST + 0.5;                   // transport stops (8.40 s)
+const DUR = Math.max(CFG.length, LAST + 2.1);
+const C0 = LAST - 3.7;                     // cutoff gesture (4.20 s)
+const P0 = LAST - 1.4, P1 = P0 + 1.2, P2 = P1 + 1.2;   // camera push 6.5-7.7, pull 7.7-8.9
+
+/* ------------------------------------------------------------------ easing */
+function bezier(x1, y1, x2, y2) {
+  const c = (u, a, b) => 3 * a * u * (1 - u) * (1 - u) + 3 * b * u * u * (1 - u) + u * u * u;
+  return x => {
+    if (x <= 0) return 0; if (x >= 1) return 1;
+    let lo = 0, hi = 1, u = x;
+    for (let i = 0; i < 28; i++) { if (c(u, x1, x2) < x) lo = u; else hi = u; u = (lo + hi) / 2; }
+    return c(u, y1, y2);
+  };
+}
+const E_KNOB = bezier(0.45, 0, 0.2, 1);
+const E_CAM  = bezier(0.65, 0, 0.35, 1);
+const E_RISE = bezier(0.22, 1, 0.36, 1);
+const E_LAMP = bezier(0.4, 0, 0.2, 1);
+const clamp = (v, a, b) => v < a ? a : v > b ? b : v;
+const prog = (t, a, b, e) => { const p = clamp((t - a) / (b - a), 0, 1); return e ? e(p) : p; };
+const lerp = (a, b, p) => a + (b - a) * p;
+const TAU = Math.PI * 2, RAD = Math.PI / 180;
+
+/* --------------------------------------------------------------------- prng */
+function mulberry32(a) {
+  return function () {
+    a |= 0; a = a + 0x6D2B79F5 | 0;
+    let t = Math.imul(a ^ a >>> 15, 1 | a);
+    t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+    return ((t ^ t >>> 14) >>> 0) / 4294967296;
+  };
+}
+const rnd = mulberry32(CFG.seed);
+const NT = 4096, NTAB = new Float32Array(NT);
+for (let i = 0; i < NT; i++) NTAB[i] = rnd() * 2 - 1;
+const sm = u => u * u * (3 - 2 * u);
+function vn1(x) { const i = Math.floor(x), f = sm(x - i); const a = NTAB[i & (NT - 1)], b = NTAB[(i + 1) & (NT - 1)]; return a + (b - a) * f; }
+function h2(i, j) { let h = Math.imul(i, 0x27d4eb2d) ^ Math.imul(j, 0x165667b1); h = Math.imul(h ^ (h >>> 15), 0x85ebca6b); h ^= h >>> 13; return NTAB[(h >>> 0) & (NT - 1)]; }
+function vn2(x, y) {
+  const xi = Math.floor(x), yi = Math.floor(y), fx = sm(x - xi), fy = sm(y - yi);
+  const a = h2(xi, yi), b = h2(xi + 1, yi), c = h2(xi, yi + 1), d = h2(xi + 1, yi + 1);
+  return lerp(lerp(a, b, fx), lerp(c, d, fx), fy);
+}
+const fbm2 = (x, y) => vn2(x, y) + 0.5 * vn2(x * 2.03, y * 2.03) + 0.25 * vn2(x * 4.1, y * 4.1);
+
+/* ------------------------------------------------------------------- fonts */
+const SILK = px => `600 ${px}px "Saira Semi Condensed", "Arial Narrow", sans-serif`;
+const LOGO = px => `${px}px Michroma, "Eurostile", "Arial", sans-serif`;
+const LCD  = px => `${px}px VT323, "Courier New", monospace`;
+await Promise.all([
+  document.fonts.load(SILK(22), 'CUTOFF 0123'),
+  document.fonts.load(LOGO(34), CFG.maker),
+  document.fonts.load(LCD(40), CFG.preset),
+]).catch(() => {});
+
+/* ------------------------------------------------------------------ layout */
+// Stage coordinates (1920x1080). Plugin 1640x780 at (140,150).
+const PL = { x: 140, y: 150, w: 1640, h: 780 };
+const CHEEK = 72;
+const FACE = { x: 212, y: 150, w: 1496, h: 630 };
+const STRIP = { x: 212, y: 780, w: 1496, h: 150 };
+const S = 2;   // texture supersampling
+
+const KNOBS = {
+  wave:   { x: 330,  y: 628, d: 92,  label: 'WAVE',      a: -40 },
+  tune:   { x: 458,  y: 628, d: 72,  label: 'TUNE',      a: 0 },
+  detune: { x: 570,  y: 628, d: 72,  label: 'DETUNE',    a: -95 },
+  cutoff: { x: 790,  y: 628, d: 132, label: 'CUTOFF',    a: -70 },
+  res:    { x: 958,  y: 628, d: 92,  label: 'RESONANCE', a: -20 },
+  env:    { x: 1088, y: 628, d: 72,  label: 'ENV AMT',   a: 35 },
+  att:    { x: 1240, y: 628, d: 72,  label: 'ATTACK',    a: -130 },
+  dec:    { x: 1358, y: 628, d: 72,  label: 'DECAY',     a: -30 },
+  sus:    { x: 1476, y: 628, d: 72,  label: 'SUSTAIN',   a: 20 },
+  rel:    { x: 1594, y: 628, d: 72,  label: 'RELEASE',   a: -60 },
+  drive:  { x: 1522, y: 360, d: 92,  label: 'DRIVE',     a: -10 },
+  level:  { x: 1630, y: 360, d: 92,  label: 'LEVEL',     a: 40 },
+};
+const SECTIONS = [
+  { title: 'OSCILLATOR', x1: 252,  x2: 640,  y: 512 },
+  { title: 'FILTER',     x1: 670,  x2: 1150, y: 512 },
+  { title: 'ENVELOPE',   x1: 1180, x2: 1668, y: 512 },
+  { title: 'OUTPUT',     x1: 1468, x2: 1688, y: 270 },
+];
+const MOVES = [
+  { k: 'wave',   t: START + 0.45, d: 0.8,  to: 60 },
+  { k: 'res',    t: START + 1.10, d: 0.7,  to: 45 },
+  { k: 'dec',    t: START + 1.70, d: 0.85, to: 40 },
+  { k: 'cutoff', t: C0 + 0.6,     d: 0.9,  to: 95 },
+];
+const VUS = [ { x: 252, y: 250, ch: 'L' }, { x: 548, y: 250, ch: 'R' } ];
+const DISP = { x: 848, y: 262, w: 488, h: 176 };
+const SCOPE = { x: 1158, y: 276, w: 164, h: 148 };
+const LADDERS = [ { x: 1366, ch: 'L' }, { x: 1410, ch: 'R' } ];
+const LAD = { y: 282, w: 36, h: 188, segH: 9, pitch: 11.5 };
+const LAD_TH = [-40, -34, -30, -26, -22, -19, -16, -13, -11, -9, -7, -5.5, -4.5, -3.5, -2.5, -1.2];
+const LAD_COL = i => i < 10 ? [57, 211, 83] : i < 14 ? [255, 176, 0] : [255, 59, 48];
+const STEPS_X = k => 506 + k * 73.5;
+const PLAYBTN = { x: 246, y: 824, w: 84, h: 52 };
+
+/* ------------------------------------------------------------ canvas utils */
+const mk = (w, h) => { const c = document.createElement('canvas'); c.width = Math.ceil(w); c.height = Math.ceil(h); return c; };
+function rrect(c, x, y, w, h, r) {
+  c.beginPath(); c.moveTo(x + r, y); c.arcTo(x + w, y, x + w, y + h, r); c.arcTo(x + w, y + h, x, y + h, r);
+  c.arcTo(x, y + h, x, y, r); c.arcTo(x, y, x + w, y, r); c.closePath();
+}
+// Silkscreen text with 0.1em tracking, drawn glyph by glyph so it works in every engine.
+function tracked(c, txt, x, y, px, font, align, track) {
+  c.font = font; const sp = px * (track == null ? 0.1 : track);
+  const ws = [...txt].map(ch => c.measureText(ch).width);
+  const total = ws.reduce((a, b) => a + b, 0) + sp * (ws.length - 1);
+  let cx = align === 'center' ? x - total / 2 : align === 'right' ? x - total : x;
+  c.textAlign = 'left';
+  [...txt].forEach((ch, i) => { c.fillText(ch, cx, y); cx += ws[i] + sp; });
+  return total;
+}
+function engravedRule(c, x1, x2, y) {
+  c.fillStyle = 'rgba(70,72,76,0.75)'; c.fillRect(x1, y, x2 - x1, 1);
+  c.fillStyle = 'rgba(255,255,255,0.75)'; c.fillRect(x1, y + 1, x2 - x1, 1);
+}
+
+/* ---------------------------------------------------------------- textures */
+function aluminium(w, h) {
+  const cv = mk(w * S, h * S), c = cv.getContext('2d'), W = cv.width, H = cv.height;
+  const img = c.createImageData(W, H), d = img.data, base = [201, 204, 207];
+  for (let y = 0; y < H; y++) {
+    const ry = rnd() * 2 - 1, off = rnd() * 3000, ny = y / H;
+    const spec = 0.075 * Math.exp(-Math.pow((ny - 0.28) / 0.15, 2)) - 0.07 * ny;   // soft specular band, lamp falloff
+    for (let x = 0; x < W; x++) {
+      let v = 0.026 * ry + 0.024 * vn1(x / (240 * S) + off) + 0.012 * vn1(x / (30 * S) + off * 1.7);
+      v = clamp(v, -0.06, 0.06);                                                       // brushing stays within +/-6%
+      const nx = (x / W - 0.5) * 2, m = 1 + v + spec - 0.05 * nx * nx;
+      const i = (y * W + x) * 4;
+      d[i] = base[0] * m; d[i + 1] = base[1] * m; d[i + 2] = base[2] * m; d[i + 3] = 255;
+    }
+  }
+  c.putImageData(img, 0, 0);
+  return cv;
+}
+function walnut(w, h, seedOff) {
+  const cv = mk(w * S, h * S), c = cv.getContext('2d'), W = cv.width, H = cv.height;
+  const img = c.createImageData(W, H), d = img.data;
+  const base = [90, 52, 32], grain = [59, 33, 19];
+  for (let y = 0; y < H; y++) {
+    const wy = y / S;
+    for (let x = 0; x < W; x++) {
+      const wx = x / S + seedOff;
+      const warp = 11 * fbm2(wx * 0.028, wy * 0.0065) + 2.4 * vn2(wx * 0.16, wy * 0.045);
+      const s = (wx + warp) / 4.6;
+      const g = Math.pow(0.5 + 0.5 * Math.sin(TAU * s), 7);
+      const fig = 0.5 + 0.5 * fbm2(wx * 0.05 + 40, wy * 0.0035);
+      const pore = (h2(x, y + seedOff * 31) > 0.985) ? 0.6 : 0;
+      const mix = clamp(0.62 * g + 0.42 * fig * fig + pore, 0, 1);
+      const lamp = 1.04 - 0.12 * (wy / h);
+      const i = (y * W + x) * 4;
+      d[i] = lerp(base[0], grain[0], mix) * lamp; d[i + 1] = lerp(base[1], grain[1], mix) * lamp;
+      d[i + 2] = lerp(base[2], grain[2], mix) * lamp; d[i + 3] = 255;
+    }
+  }
+  c.putImageData(img, 0, 0);
+  return cv;
+}
+function anodized(w, h) {
+  const cv = mk(w * S, h * S), c = cv.getContext('2d'), W = cv.width, H = cv.height;
+  const img = c.createImageData(W, H), d = img.data;
+  for (let y = 0; y < H; y++) for (let x = 0; x < W; x++) {
+    const m = 1 + 0.025 * (rnd() * 2 - 1) - 0.06 * (y / H), i = (y * W + x) * 4;
+    d[i] = 27 * m; d[i + 1] = 28 * m; d[i + 2] = 31 * m; d[i + 3] = 255;
+  }
+  c.putImageData(img, 0, 0);
+  return cv;
+}
+function screw(c, x, y, r, ang) {
+  c.save();
+  c.shadowColor = 'rgba(0,0,0,0.45)'; c.shadowBlur = 3 * S; c.shadowOffsetY = 1.5 * S;
+  const g = c.createRadialGradient(x - r * 0.35, y - r * 0.4, r * 0.1, x, y, r);
+  g.addColorStop(0, '#EEF0F2'); g.addColorStop(0.6, '#B4B7BB'); g.addColorStop(1, '#7C8085');
+  c.beginPath(); c.arc(x, y, r, 0, TAU); c.fillStyle = g; c.fill();
+  c.restore();
+  c.beginPath(); c.arc(x, y, r, 0, TAU); c.strokeStyle = 'rgba(60,62,66,0.8)'; c.lineWidth = 1; c.stroke();
+  c.save(); c.translate(x, y); c.rotate(ang);
+  c.fillStyle = '#2A2B2E'; c.fillRect(-r * 0.86, -r * 0.15, r * 1.72, r * 0.3);
+  c.fillStyle = 'rgba(255,255,255,0.55)'; c.fillRect(-r * 0.8, r * 0.15, r * 1.6, 0.8);
+  c.restore();
+}
+
+/* ------------------------------------------------------------- knob sprites */
+const SPR = {};
+function knobSprites(d) {
+  const r = d / 2, R = r + 3, px = 2 * R * S, rc = r * 0.76;
+  const kn = mk(px, px), k = kn.getContext('2d');
+  k.scale(S, S); k.translate(R, R);
+  k.beginPath(); k.arc(0, 0, r, 0, TAU); k.fillStyle = '#2B2C2F'; k.fill();
+  const n = Math.round(TAU * r / 5.2);
+  for (let i = 0; i < n; i++) {
+    k.save(); k.rotate(i / n * TAU);
+    k.fillStyle = '#56585D'; k.fillRect(-0.85, -r, 1.7, r - rc + 1);
+    k.fillStyle = '#121315'; k.fillRect(0.95, -r, 1.1, r - rc + 1);
+    k.restore();
+  }
+  k.beginPath(); k.arc(0, 0, r - 0.5, 0, TAU); k.strokeStyle = '#0B0B0C'; k.lineWidth = 1; k.stroke();
+
+  // Fixed lighting over the skirt: never rotates.
+  const lt = mk(px, px), l = lt.getContext('2d');
+  l.scale(S, S); l.translate(R, R);
+  l.beginPath(); l.arc(0, 0, r, 0, TAU); l.arc(0, 0, rc - 0.5, 0, TAU, true);
+  const lg = l.createLinearGradient(-r * 0.3, -r, r * 0.3, r);
+  lg.addColorStop(0, 'rgba(255,255,255,0.34)'); lg.addColorStop(0.42, 'rgba(255,255,255,0.05)');
+  lg.addColorStop(0.62, 'rgba(0,0,0,0.08)'); lg.addColorStop(1, 'rgba(0,0,0,0.5)');
+  l.fillStyle = lg; l.fill();
+  l.beginPath(); l.arc(0, 0, r - 0.8, -Math.PI * 0.86, -Math.PI * 0.18);
+  l.strokeStyle = 'rgba(255,255,255,0.4)'; l.lineWidth = 1.2; l.stroke();
+
+  // Matte black cap with a conic sheen fixed to the lamp.
+  const cp = mk(px, px), c = cp.getContext('2d');
+  c.scale(S, S); c.translate(R, R);
+  c.save(); c.shadowColor = 'rgba(0,0,0,0.6)'; c.shadowBlur = 3 * S; c.shadowOffsetY = 1.5 * S;
+  c.beginPath(); c.arc(0, 0, rc, 0, TAU); c.fillStyle = '#121315'; c.fill(); c.restore();
+  const rg = c.createRadialGradient(-rc * 0.25, -rc * 0.45, rc * 0.05, 0, 0, rc);
+  rg.addColorStop(0, '#2B2C30'); rg.addColorStop(0.55, '#17181B'); rg.addColorStop(1, '#0C0C0E');
+  c.beginPath(); c.arc(0, 0, rc, 0, TAU); c.fillStyle = rg; c.fill();
+  if (c.createConicGradient) {
+    const cg = c.createConicGradient(0, 0, 0);
+    cg.addColorStop(0.0, 'rgba(255,255,255,0.02)');
+    cg.addColorStop(0.125, 'rgba(255,255,255,0.07)');
+    cg.addColorStop(0.375, 'rgba(255,255,255,0.0)');
+    cg.addColorStop(0.625, 'rgba(255,255,255,0.15)');
+    cg.addColorStop(0.875, 'rgba(255,255,255,0.0)');
+    cg.addColorStop(1.0, 'rgba(255,255,255,0.02)');
+    c.beginPath(); c.arc(0, 0, rc, 0, TAU); c.fillStyle = cg; c.fill();
+  }
+  const rim = c.createLinearGradient(0, -rc, 0, rc);
+  rim.addColorStop(0, 'rgba(255,255,255,0.32)'); rim.addColorStop(0.5, 'rgba(255,255,255,0.04)'); rim.addColorStop(1, 'rgba(0,0,0,0.6)');
+  c.beginPath(); c.arc(0, 0, rc - 0.8, 0, TAU); c.strokeStyle = rim; c.lineWidth = 1.4; c.stroke();
+  return { knurl: kn, light: lt, cap: cp, R, r, rc };
+}
+for (const k of Object.values(KNOBS)) if (!SPR[k.d]) SPR[k.d] = knobSprites(k.d);
+
+/* -------------------------------------------------------------- VU geometry */
+const vuGeo = v => {
+  const fx = v.x + 12, fy = v.y + 12, fw = 256, fh = 176;
+  return { fx, fy, fw, fh, cx: fx + fw / 2, py: fy + fh + 20 };
+};
+const VU_POS = db => Math.pow(10, db / 20) / Math.pow(10, 3 / 20);   // linear in voltage, +3 VU = full scale
+const VU_ANG = pos => (-45 + 90 * pos) * RAD;
+
+/* ------------------------------------------------------------ static layer */
+const shadowCv = (() => {
+  const k = 0.5, pad = 220, cv = mk((PL.w + pad * 2) * k, (PL.h + pad * 2) * k), c = cv.getContext('2d');
+  c.scale(k, k);
+  c.shadowColor = 'rgba(0,0,0,0.78)'; c.shadowBlur = 80 * k;
+  c.shadowOffsetX = -10000 * k; c.shadowOffsetY = 34 * k;
+  rrect(c, pad + 10000 + 8, pad + 4, PL.w - 16, PL.h - 8, 16); c.fill();
+  return cv;
+})();
+
+const staticCv = mk(PL.w * S, PL.h * S);
+(() => {
+  const c = staticCv.getContext('2d');
+  c.setTransform(S, 0, 0, S, -PL.x * S, -PL.y * S);
+  c.textBaseline = 'alphabetic';
+
+  // Plugin body clip (rounded outer corners on the cheeks).
+  c.save(); rrect(c, PL.x, PL.y, PL.w, PL.h, 16); c.clip();
+
+  c.drawImage(aluminium(FACE.w, FACE.h), FACE.x, FACE.y, FACE.w, FACE.h);
+  c.drawImage(anodized(STRIP.w, STRIP.h), STRIP.x, STRIP.y, STRIP.w, STRIP.h);
+  c.drawImage(walnut(CHEEK, PL.h, 0), PL.x, PL.y, CHEEK, PL.h);
+  c.drawImage(walnut(CHEEK, PL.h, 517), PL.x + PL.w - CHEEK, PL.y, CHEEK, PL.h);
+
+  // Walnut chamfer (#8A5634), lit from above.
+  for (const cx of [PL.x, PL.x + PL.w - CHEEK]) {
+    const left = cx === PL.x;
+    c.save(); c.beginPath(); c.rect(cx, PL.y, CHEEK, PL.h); c.clip();
+    const g = c.createLinearGradient(0, PL.y, 0, PL.y + PL.h);
+    g.addColorStop(0, 'rgba(160,104,64,0.95)'); g.addColorStop(0.5, 'rgba(138,86,52,0.8)'); g.addColorStop(1, 'rgba(96,58,34,0.8)');
+    c.strokeStyle = g; c.lineWidth = 10;
+    if (left) rrect(c, cx, PL.y, CHEEK + 40, PL.h, 16); else rrect(c, cx - 40, PL.y, CHEEK + 40, PL.h, 16);
+    c.stroke();
+    c.strokeStyle = 'rgba(30,16,8,0.65)'; c.lineWidth = 1;
+    if (left) rrect(c, cx + 5.5, PL.y + 5.5, CHEEK + 40, PL.h - 11, 11); else rrect(c, cx - 45.5, PL.y + 5.5, CHEEK + 40, PL.h - 11, 11);
+    c.stroke();
+    c.restore();
+  }
+  // Cheeks cast a soft shadow onto the metal; seam between faceplate and strip.
+  const sh = (x, dir) => {
+    const g = c.createLinearGradient(x, 0, x + dir * 22, 0);
+    g.addColorStop(0, 'rgba(0,0,0,0.42)'); g.addColorStop(1, 'rgba(0,0,0,0)');
+    c.fillStyle = g; c.fillRect(Math.min(x, x + dir * 22), PL.y, 22, PL.h);
+  };
+  sh(FACE.x, 1); sh(FACE.x + FACE.w, -1);
+  c.fillStyle = 'rgba(255,255,255,0.55)'; c.fillRect(FACE.x, FACE.y, FACE.w, 1);
+  c.fillStyle = '#0A0A0B'; c.fillRect(STRIP.x, STRIP.y - 1, STRIP.w, 2);
+  c.fillStyle = 'rgba(255,255,255,0.10)'; c.fillRect(STRIP.x, STRIP.y + 1, STRIP.w, 1);
+
+  // Lamp falloff across the whole body (static: the light never moves).
+  const vg = c.createRadialGradient(960, 330, 200, 960, 420, 1050);
+  vg.addColorStop(0, 'rgba(0,0,0,0)'); vg.addColorStop(1, 'rgba(0,0,0,0.26)');
+  c.fillStyle = vg; c.fillRect(PL.x, PL.y, PL.w, PL.h);
+  c.restore();
+
+  // Screws.
+  for (const [x, y] of [[232, 170], [1688, 170], [232, 760], [1688, 760]]) screw(c, x, y, 9, rnd() * Math.PI);
+
+  // Header.
+  c.fillStyle = '#1E1F22';
+  const lw = tracked(c, CFG.maker, 268, 206, 34, LOGO(34), 'left', 0.06);
+  c.fillStyle = 'rgba(30,31,34,0.55)'; c.fillRect(268 + lw + 22, 178, 2, 32);
+  c.fillStyle = '#1E1F22';
+  tracked(c, `${CFG.model} ${CFG.kind}`, 268 + lw + 46, 204, 22, SILK(22), 'left');
+  engravedRule(c, 268, 1652, 228);
+
+  // Section titles between engraved rules.
+  for (const s of SECTIONS) {
+    const mid = (s.x1 + s.x2) / 2;
+    c.fillStyle = '#222326';
+    const w = tracked(c, s.title, mid, s.y, 22, SILK(22), 'center');
+    engravedRule(c, s.x1, mid - w / 2 - 14, s.y - 8);
+    engravedRule(c, mid + w / 2 + 14, s.x2, s.y - 8);
+  }
+
+  // Knob ticks, drop shadows and labels.
+  for (const k of Object.values(KNOBS)) {
+    const r = k.d / 2;
+    c.strokeStyle = '#26272A'; c.lineCap = 'butt';
+    for (let i = 0; i <= 10; i++) {
+      const a = (-150 + i * 30) * RAD, ext = (i === 0 || i === 5 || i === 10) ? 16 : 12;
+      c.lineWidth = (i === 0 || i === 5 || i === 10) ? 2.4 : 1.8;
+      c.beginPath();
+      c.moveTo(k.x + Math.sin(a) * (r + 6), k.y - Math.cos(a) * (r + 6));
+      c.lineTo(k.x + Math.sin(a) * (r + ext), k.y - Math.cos(a) * (r + ext));
+      c.stroke();
+    }
+    c.save(); c.shadowColor = 'rgba(0,0,0,0.5)'; c.shadowBlur = 14 * S; c.shadowOffsetY = 7 * S;
+    c.beginPath(); c.arc(k.x, k.y, r - 1, 0, TAU); c.fillStyle = '#1A1B1D'; c.fill(); c.restore();
+    c.fillStyle = '#222326';
+    tracked(c, k.label, k.x, k.y > 500 ? 742 : 452, 20, SILK(20), 'center');
+  }
+
+  // VU housings and faces.
+  for (const v of VUS) {
+    const g = vuGeo(v);
+    c.save(); c.shadowColor = 'rgba(0,0,0,0.5)'; c.shadowBlur = 8 * S; c.shadowOffsetY = 3 * S;
+    rrect(c, v.x, v.y, 280, 200, 10); c.fillStyle = '#1D1B19'; c.fill(); c.restore();
+    rrect(c, v.x + 1, v.y + 1, 278, 198, 9.5); c.strokeStyle = 'rgba(255,255,255,0.10)'; c.lineWidth = 1; c.stroke();
+    const fg = c.createRadialGradient(g.cx, g.fy + g.fh, 20, g.cx, g.fy + g.fh * 0.6, 220);
+    fg.addColorStop(0, '#F8EED2'); fg.addColorStop(0.7, '#F2E7C6'); fg.addColorStop(1, '#DCCDA4');
+    rrect(c, g.fx, g.fy, g.fw, g.fh, 4); c.fillStyle = fg; c.fill();
+    c.save(); rrect(c, g.fx, g.fy, g.fw, g.fh, 4); c.clip();
+    // Scale.
+    const arc = (r0, p0, p1) => { c.beginPath(); c.arc(g.cx, g.py, r0, -Math.PI / 2 + VU_ANG(p0), -Math.PI / 2 + VU_ANG(p1)); };
+    c.strokeStyle = '#C8312A'; c.lineWidth = 9; arc(155.5, VU_POS(0), 1); c.stroke();
+    c.strokeStyle = '#1F1C18'; c.lineWidth = 1.4; arc(150, 0, 1); c.stroke();
+    for (const db of [-20, -10, -7, -5, -3, -2, -1, 0, 1, 2, 3]) {
+      const a = VU_ANG(VU_POS(db)), major = [-20, -7, -3, 0, 3].includes(db);
+      const r1 = 150, r2 = major ? 166 : 160;
+      c.strokeStyle = db > 0 ? '#8E1E19' : '#1F1C18'; c.lineWidth = major ? 2 : 1.4;
+      c.beginPath(); c.moveTo(g.cx + Math.sin(a) * r1, g.py - Math.cos(a) * r1);
+      c.lineTo(g.cx + Math.sin(a) * r2, g.py - Math.cos(a) * r2); c.stroke();
+      if (major) {
+        c.fillStyle = db > 0 ? '#B02A23' : '#1F1C18';
+        c.save(); c.translate(g.cx + Math.sin(a) * 126, g.py - Math.cos(a) * 126); c.rotate(a);
+        tracked(c, db > 0 ? '+' + db : String(db), 0, 7, 20, SILK(20), 'center', 0.02); c.restore();
+      }
+    }
+    c.fillStyle = '#1F1C18'; tracked(c, 'VU', g.cx, g.py - 62, 22, SILK(22), 'center');
+    tracked(c, v.ch, g.fx + 14, g.fy + g.fh - 12, 20, SILK(20), 'left');
+    c.restore();
+    // Inner bezel shadow.
+    c.save(); rrect(c, g.fx, g.fy, g.fw, g.fh, 4); c.clip();
+    c.shadowColor = 'rgba(0,0,0,0.55)'; c.shadowBlur = 8 * S; c.shadowOffsetY = 3 * S;
+    c.lineWidth = 6; c.strokeStyle = '#000'; rrect(c, g.fx - 3, g.fy - 3, g.fw + 6, g.fh + 6, 6); c.stroke();
+    c.restore();
+  }
+
+  // Display bezel, glass and scope graticule.
+  c.save(); c.shadowColor = 'rgba(0,0,0,0.5)'; c.shadowBlur = 8 * S; c.shadowOffsetY = 3 * S;
+  rrect(c, DISP.x, DISP.y, DISP.w, DISP.h, 8); c.fillStyle = '#0B0B0C'; c.fill(); c.restore();
+  rrect(c, DISP.x + 6, DISP.y + 6, DISP.w - 12, DISP.h - 12, 4); c.fillStyle = '#1B1206'; c.fill();
+  c.fillStyle = '#120C04'; c.fillRect(SCOPE.x - 10, DISP.y + 6, 2, DISP.h - 12);
+  c.fillStyle = '#160E05'; c.fillRect(SCOPE.x, SCOPE.y, SCOPE.w, SCOPE.h);
+  c.strokeStyle = 'rgba(255,176,0,0.09)'; c.lineWidth = 1;
+  for (let i = 1; i < 4; i++) { const x = SCOPE.x + SCOPE.w * i / 4; c.beginPath(); c.moveTo(x, SCOPE.y); c.lineTo(x, SCOPE.y + SCOPE.h); c.stroke(); }
+  for (let i = 1; i < 4; i++) { const y = SCOPE.y + SCOPE.h * i / 4; c.beginPath(); c.moveTo(SCOPE.x, y); c.lineTo(SCOPE.x + SCOPE.w, y); c.stroke(); }
+
+  // LED ladder housings.
+  for (const L of LADDERS) {
+    rrect(c, L.x, LAD.y, LAD.w, LAD.h, 4); c.fillStyle = '#0D0D0F'; c.fill();
+    c.strokeStyle = 'rgba(255,255,255,0.35)'; c.lineWidth = 1; rrect(c, L.x - 0.5, LAD.y - 0.5, LAD.w + 1, LAD.h + 1, 4.5); c.stroke();
+    c.fillStyle = '#222326'; tracked(c, L.ch, L.x + LAD.w / 2, 272, 20, SILK(20), 'center');
+  }
+
+  // Sequencer strip.
+  const btn = (x, y, w, h, light) => {
+    c.save(); c.shadowColor = 'rgba(0,0,0,0.7)'; c.shadowBlur = 5 * S; c.shadowOffsetY = 3 * S;
+    rrect(c, x, y, w, h, 6); c.fillStyle = '#111214'; c.fill(); c.restore();
+    const g = c.createLinearGradient(0, y, 0, y + h);
+    g.addColorStop(0, light ? '#3A3B40' : '#2E2F33'); g.addColorStop(1, light ? '#25262A' : '#1D1E21');
+    rrect(c, x + 1, y + 1, w - 2, h - 2, 5); c.fillStyle = g; c.fill();
+    c.fillStyle = 'rgba(255,255,255,0.16)'; c.fillRect(x + 6, y + 2, w - 12, 1);
+  };
+  const socket = (x, y) => {
+    c.beginPath(); c.arc(x, y, 7, 0, TAU); c.fillStyle = '#09090A'; c.fill();
+    c.beginPath(); c.arc(x, y, 7, Math.PI * 0.1, Math.PI * 0.9); c.strokeStyle = 'rgba(255,255,255,0.12)'; c.lineWidth = 1; c.stroke();
+  };
+  btn(PLAYBTN.x, PLAYBTN.y, PLAYBTN.w, PLAYBTN.h, true);
+  socket(PLAYBTN.x + PLAYBTN.w / 2, 806);
+  c.fillStyle = '#C9C4B9';
+  tracked(c, 'PLAY', PLAYBTN.x + PLAYBTN.w / 2, 912, 20, SILK(20), 'center');
+  c.fillStyle = '#ECE7DC'; tracked(c, `${CFG.bpm} BPM`, 418, 858, 22, SILK(22), 'center');
+  c.fillStyle = '#C9C4B9'; tracked(c, 'TEMPO', 418, 912, 20, SILK(20), 'center');
+  c.fillStyle = '#0A0A0B'; c.fillRect(484, 800, 1, 118); c.fillStyle = 'rgba(255,255,255,0.08)'; c.fillRect(485, 800, 1, 118);
+  for (let k = 0; k < 16; k++) {
+    const x = STEPS_X(k);
+    btn(x, 824, 58, 52, (k >> 2) % 2 === 0);
+    socket(x + 29, 806);
+    c.fillStyle = '#C9C4B9'; tracked(c, String(k + 1), x + 29, 912, 20, SILK(20), 'center', 0.02);
+  }
+})();
+
+/* ----------------------------------------------------------------- signal */
+// Precomputed once at a fixed 1/240 s step; seek(t) only reads these arrays.
+const FS = 240, N = Math.ceil((DUR + 0.5) * FS) + 2;
+const hitRnd = mulberry32(CFG.seed * 7 + 3);
+const HITS = [];
+for (let b = 0; b < BARS; b++) for (const s of CFG.active) {
+  HITS.push({ t: START + (b * 16 + s - 1) * STEP, a: CFG.accents.includes(s) ? 1.4 : 1, l: 1 + 0.05 * (hitRnd() * 2 - 1), r: 0.97 + 0.05 * (hitRnd() * 2 - 1) });
+}
+HITS.push({ t: LAST, a: 1.4, l: 1, r: 0.98 });
+const env = dt => dt < 0 ? 0 : dt < 0.005 ? dt / 0.005 : Math.exp(-(dt - 0.005) / 0.06);   // 5 ms attack, ~180 ms decay to -26 dB
+const SIG_L = new Float32Array(N), SIG_R = new Float32Array(N);
+for (let i = 0; i < N; i++) {
+  const t = i / FS;
+  for (const h of HITS) { const dt = t - h.t; if (dt < 0 || dt > 1.5) continue; const e = env(dt) * h.a; SIG_L[i] += e * h.l; SIG_R[i] += e * h.r; }
+}
+// Needle: 2nd-order system, zeta from 1.5% overshoot, omega solved so the step response reaches 99% in 300 ms.
+const ZETA = (() => { const l = Math.log(0.015); return -l / Math.sqrt(Math.PI * Math.PI + l * l); })();
+const SUB = 8, HSTEP = 1 / (FS * SUB);
+function t99(w) { let x = 0, v = 0, t = 0; while (x < 0.99 && t < 5) { v += (w * w * (1 - x) - 2 * ZETA * w * v) * HSTEP; x += v * HSTEP; t += HSTEP; } return t; }
+const OMEGA = (() => { let lo = 1, hi = 200; for (let i = 0; i < 50; i++) { const m = (lo + hi) / 2; if (t99(m) > 0.3) lo = m; else hi = m; } return (lo + hi) / 2; })();
+function needle(sig, k) {
+  const out = new Float32Array(N); let x = 0, v = 0;
+  for (let i = 0; i < N; i++) {
+    const u = sig[i] * k;
+    for (let s = 0; s < SUB; s++) {
+      v += (OMEGA * OMEGA * (u - x) - 2 * ZETA * OMEGA * v) * HSTEP; x += v * HSTEP;
+      if (x < 0) { x = 0; if (v < 0) v = 0; } if (x > 1.04) { x = 1.04; if (v > 0) v = 0; }
+    }
+    out[i] = x;
+  }
+  return out;
+}
+const rawMax = needle(SIG_L, 1).reduce((m, v) => Math.max(m, v), 0);
+const K_VU = VU_POS(0) / rawMax;                 // accents kiss 0 VU
+const NEEDLE_L = needle(SIG_L, K_VU), NEEDLE_R = needle(SIG_R, K_VU);
+const SIG_MAX = SIG_L.reduce((m, v) => Math.max(m, v), 0);
+const K_LAD = Math.pow(10, -1.5 / 20) / SIG_MAX;   // accent peaks at -1.5 dBFS
+function ladder(sig) {
+  const lad = new Float32Array(N), pk = new Float32Array(N); let l = -100, p = -100, hold = 0;
+  for (let i = 0; i < N; i++) {
+    const db = 20 * Math.log10(Math.max(sig[i] * K_LAD, 1e-6));
+    l = Math.max(db, l - 36 / FS);                                    // instant rise, 36 dB/s fall
+    if (l >= p) { p = l; hold = i / FS + 0.4; } else if (i / FS > hold) p = Math.max(l, p - 60 / FS);
+    lad[i] = l; pk[i] = p;
+  }
+  return [lad, pk];
+}
+const [LAD_L, PK_L] = ladder(SIG_L), [LAD_R, PK_R] = ladder(SIG_R);
+const read = (arr, t) => { const f = clamp(t, 0, DUR) * FS, i = Math.floor(f), u = f - i; return lerp(arr[i], arr[Math.min(i + 1, N - 1)], u); };
+
+/* ---------------------------------------------------------- state from t */
+function knobAngle(name, t) {
+  let a = KNOBS[name].a;
+  for (const m of MOVES) if (m.k === name) a = lerp(a, m.to, prog(t, m.t, m.t + m.d, E_KNOB));
+  return a;
+}
+const knobNorm = (name, t) => (knobAngle(name, t) + 150) / 300;
+const cutoffHz = t => 380 * Math.pow(4800 / 380, clamp((knobAngle('cutoff', t) + 70) / 165, 0, 1));
+const fmtHz = f => f < 1000 ? `${Math.round(f / 10) * 10} Hz` : `${(f / 1000).toFixed(1)} kHz`;
+function camera(t) {
+  const p = t < P1 ? prog(t, P0, P1, E_CAM) : 1 - prog(t, P1, P2, E_CAM);
+  const z = lerp(1, 1.4, p);
+  // Focus on the VU pair, clamped so the view never leaves the stage.
+  const fx = Math.max(540, 960 / 1.4), fy = Math.max(350, 540 / 1.4);
+  return { z, x: lerp(960, fx, p), y: lerp(540, fy, p) };
+}
+function stepLed(j, t) {
+  if (t < START) return 0;
+  const tt = Math.min(t, STOP - 1e-6), g = Math.floor((tt - START) / STEP);
+  const gj = g - (((g - j) % 16) + 16) % 16;
+  let b = 0;
+  if (gj >= 0) { const on = START + gj * STEP, off = Math.min(on + STEP, STOP); b = t < off ? 1 : Math.exp(-(t - off) / 0.09); }
+  if (j === 0 && t >= STOP) b = Math.max(b, sm(prog(t, STOP, STOP + 0.25)));
+  return b;
+}
+
+/* -------------------------------------------------------------------- draw */
+const cv = document.getElementById('stage');
+const ctx = cv.getContext('2d');
+let G = 1;   // device pixels per stage pixel for the current frame (shadowBlur is not transformed)
+
+function drawKnob(k, ang) {
+  const s = SPR[k.d], R = s.R;
+  ctx.save(); ctx.translate(k.x, k.y); ctx.rotate(ang * RAD); ctx.drawImage(s.knurl, -R, -R, 2 * R, 2 * R); ctx.restore();
+  ctx.drawImage(s.light, k.x - R, k.y - R, 2 * R, 2 * R);
+  ctx.drawImage(s.cap, k.x - R, k.y - R, 2 * R, 2 * R);
+  ctx.save(); ctx.translate(k.x, k.y); ctx.rotate(ang * RAD);
+  ctx.strokeStyle = '#F3F1EA'; ctx.lineCap = 'round'; ctx.lineWidth = Math.max(2.2, s.r * 0.075);
+  ctx.beginPath(); ctx.moveTo(0, -s.rc * 0.34); ctx.lineTo(0, -s.rc * 0.9); ctx.stroke();
+  ctx.restore();
+}
+
+function drawVU(v, pos, warm) {
+  const g = vuGeo(v);
+  ctx.save(); rrect(ctx, g.fx, g.fy, g.fw, g.fh, 4); ctx.clip();
+  // Backlight: unlit face sits in shadow, then warms.
+  ctx.fillStyle = `rgba(24,14,4,${0.5 * (1 - warm)})`; ctx.fillRect(g.fx, g.fy, g.fw, g.fh);
+  const bl = ctx.createRadialGradient(g.cx, g.fy + g.fh + 10, 10, g.cx, g.fy + g.fh, 230);
+  bl.addColorStop(0, `rgba(255,170,70,${0.26 * warm})`); bl.addColorStop(1, 'rgba(255,170,70,0)');
+  ctx.fillStyle = bl; ctx.fillRect(g.fx, g.fy, g.fw, g.fh);
+  // Needle with its shadow on the face.
+  const a = VU_ANG(pos), sx = Math.sin(a), cy = Math.cos(a);
+  ctx.lineCap = 'round';
+  ctx.strokeStyle = 'rgba(50,30,10,0.22)'; ctx.lineWidth = 2.4;
+  ctx.beginPath(); ctx.moveTo(g.cx + sx * 24 + 3, g.py - cy * 24 + 4); ctx.lineTo(g.cx + sx * 164 + 3, g.py - cy * 164 + 4); ctx.stroke();
+  ctx.strokeStyle = '#1A1715'; ctx.lineWidth = 2;
+  ctx.beginPath(); ctx.moveTo(g.cx + sx * 24, g.py - cy * 24); ctx.lineTo(g.cx + sx * 164, g.py - cy * 164); ctx.stroke();
+  // Pivot cover and fixed glass reflection.
+  rrect(ctx, g.cx - 36, g.fy + g.fh - 18, 72, 26, 8); ctx.fillStyle = '#1B1916'; ctx.fill();
+  ctx.fillStyle = 'rgba(255,255,255,0.08)'; ctx.fillRect(g.cx - 30, g.fy + g.fh - 17, 60, 1);
+  const gl = ctx.createLinearGradient(g.fx, g.fy, g.fx + g.fw * 0.7, g.fy + g.fh);
+  gl.addColorStop(0, 'rgba(255,255,255,0.16)'); gl.addColorStop(0.45, 'rgba(255,255,255,0.03)'); gl.addColorStop(0.46, 'rgba(255,255,255,0)');
+  ctx.fillStyle = gl; ctx.fillRect(g.fx, g.fy, g.fw, g.fh);
+  ctx.restore();
+}
+
+function drawLadder(L, db, pk) {
+  const segs = LAD_TH.length;
+  let pkSeg = -1; for (let i = 0; i < segs; i++) if (pk >= LAD_TH[i]) pkSeg = i;
+  for (let i = 0; i < segs; i++) {
+    const y = LAD.y + LAD.h - 4 - (i + 1) * LAD.pitch + (LAD.pitch - LAD.segH), x = L.x + 6, w = LAD.w - 12;
+    const [r, g, b] = LAD_COL(i);
+    let on = clamp((db - LAD_TH[i]) / 1.2 + 1, 0, 1);
+    if (i === pkSeg && pkSeg > 0) on = Math.max(on, 0.9);
+    ctx.fillStyle = `rgba(${r},${g},${b},0.14)`; ctx.fillRect(x, y, w, LAD.segH);
+    if (on > 0.01) {
+      ctx.save(); ctx.globalAlpha = on;
+      ctx.shadowColor = `rgba(${r},${g},${b},0.75)`; ctx.shadowBlur = 9 * G;
+      ctx.fillStyle = `rgb(${r},${g},${b})`; ctx.fillRect(x, y, w, LAD.segH);
+      ctx.restore();
+    }
+  }
+}
+
+function led(x, y, rgb, b, base) {
+  const [r, g, bl] = rgb, a = Math.max(base, b);
+  ctx.beginPath(); ctx.arc(x, y, 5, 0, TAU); ctx.fillStyle = `rgba(${r},${g},${bl},0.14)`; ctx.fill();
+  if (a <= 0.01) return;
+  ctx.save(); ctx.globalAlpha = a;
+  ctx.shadowColor = `rgba(${r},${g},${bl},0.9)`; ctx.shadowBlur = 12 * G * b;
+  ctx.beginPath(); ctx.arc(x, y, 5, 0, TAU); ctx.fillStyle = `rgb(${r},${g},${bl})`; ctx.fill();
+  ctx.fillStyle = 'rgba(255,255,255,0.55)'; ctx.beginPath(); ctx.arc(x - 1.4, y - 1.6, 1.6, 0, TAU); ctx.fill();
+  ctx.restore();
+}
+
+function drawDisplay(t, on, play) {
+  if (on <= 0) return;
+  ctx.save(); ctx.globalAlpha = on;
+  ctx.fillStyle = '#FFB000'; ctx.shadowColor = 'rgba(255,176,0,0.55)'; ctx.shadowBlur = 7 * G;
+  ctx.font = LCD(40); ctx.textAlign = 'left';
+  ctx.fillText(CFG.preset, 870, 316);
+  ctx.fillText(`${CFG.bpm} BPM  4/4`, 870, 358);
+  ctx.fillText(play ? 'SEQ PLAY' : 'SEQ STOP', 870, 400);
+  // Scope: a saw/square blend (Wave) through a 2-pole lowpass at Cutoff with a Resonance bump.
+  const fc = cutoffHz(t), wv = knobNorm('wave', t), rs = knobNorm('res', t), f0 = 110;
+  const amp = clamp(read(SIG_L, t) / SIG_MAX * 1.25, 0, 1);
+  const H = 32, coef = new Float32Array(H + 1);
+  for (let k = 1; k <= H; k++) {
+    const hk = 1 / Math.sqrt(1 + Math.pow(k * f0 / fc, 4)) * (1 + rs * 1.8 * Math.exp(-Math.pow((k * f0 - fc) / (0.2 * fc), 2)));
+    coef[k] = ((1 - wv) / k + wv * (k % 2 ? 1 / k : 0)) * hk;
+  }
+  const pts = 140, ys = new Float32Array(pts + 1); let mx = 1e-6;
+  for (let i = 0; i <= pts; i++) { const ph = i / pts * 2 * TAU; let y = 0; for (let k = 1; k <= H; k++) y += coef[k] * Math.sin(k * ph); ys[i] = y; mx = Math.max(mx, Math.abs(y)); }
+  const bright = 0.35 + 0.65 * clamp((knobAngle('cutoff', t) + 70) / 165, 0, 1);
+  ctx.save(); ctx.beginPath(); ctx.rect(SCOPE.x, SCOPE.y, SCOPE.w, SCOPE.h); ctx.clip();
+  ctx.strokeStyle = `rgba(255,176,0,${0.95 * bright})`; ctx.lineWidth = 2; ctx.lineJoin = 'round';
+  ctx.shadowColor = `rgba(255,176,0,${0.7 * bright})`; ctx.shadowBlur = 8 * G * bright;
+  ctx.beginPath();
+  for (let i = 0; i <= pts; i++) {
+    const x = SCOPE.x + 6 + (SCOPE.w - 12) * i / pts, y = SCOPE.y + SCOPE.h / 2 - ys[i] / mx * 58 * amp;
+    i ? ctx.lineTo(x, y) : ctx.moveTo(x, y);
+  }
+  ctx.stroke(); ctx.restore();
+  ctx.restore();
+}
+
+function drawCursor(x, y, s, a) {
+  ctx.save(); ctx.globalAlpha = a; ctx.translate(x, y); ctx.scale(1.2 * s, 1.2 * s);
+  ctx.shadowColor = 'rgba(0,0,0,0.5)'; ctx.shadowBlur = 6 * G; ctx.shadowOffsetY = 2 * G;
+  ctx.beginPath();
+  ctx.moveTo(0, 0); ctx.lineTo(0, 26); ctx.lineTo(6.4, 20.2); ctx.lineTo(10.6, 29.6); ctx.lineTo(14.6, 27.8);
+  ctx.lineTo(10.5, 18.6); ctx.lineTo(19, 18.6); ctx.closePath();
+  ctx.fillStyle = '#FFFFFF'; ctx.fill();
+  ctx.shadowColor = 'transparent'; ctx.strokeStyle = '#111'; ctx.lineWidth = 1.4; ctx.lineJoin = 'round'; ctx.stroke();
+  ctx.restore();
+}
+
+function drawTooltip(x, y, text, a) {
+  ctx.save(); ctx.globalAlpha = a;
+  ctx.font = SILK(22);
+  const w = 26 + [...text].reduce((s, ch) => s + ctx.measureText(ch).width, 0) + 2.2 * (text.length - 1);
+  ctx.shadowColor = 'rgba(0,0,0,0.45)'; ctx.shadowBlur = 14 * G; ctx.shadowOffsetY = 4 * G;
+  rrect(ctx, x, y, w, 44, 7); ctx.fillStyle = 'rgba(18,19,21,0.94)'; ctx.fill();
+  ctx.shadowColor = 'transparent';
+  ctx.strokeStyle = 'rgba(255,255,255,0.14)'; ctx.lineWidth = 1; ctx.stroke();
+  ctx.fillStyle = '#EDEBE6'; tracked(ctx, text, x + 13, y + 30, 22, SILK(22), 'left');
+  ctx.restore();
+}
+
+function seek(tIn) {
+  const t = clamp(+tIn || 0, 0, DUR);
+  // Size from CSS size x devicePixelRatio (pure function of the window, no frame state).
+  const dpr = Math.min(window.devicePixelRatio || 1, 3);
+  const W = Math.max(1, Math.round(cv.clientWidth * dpr)), H = Math.max(1, Math.round(cv.clientHeight * dpr));
+  if (cv.width !== W || cv.height !== H) { cv.width = W; cv.height = H; }
+  const fit = Math.min(W / 1920, H / 1080), ox = (W - 1920 * fit) / 2, oy = (H - 1080 * fit) / 2;
+  const cam = camera(t);
+  G = fit * cam.z;
+
+  ctx.setTransform(1, 0, 0, 1, 0, 0);
+  ctx.imageSmoothingEnabled = true; ctx.imageSmoothingQuality = 'high';
+  ctx.fillStyle = '#16120E'; ctx.fillRect(0, 0, W, H);
+  ctx.setTransform(G, 0, 0, G, ox + fit * (960 - cam.x * cam.z), oy + fit * (540 - cam.y * cam.z));
+
+  // Lamp pool.
+  const lamp = prog(t, 0, 1.0, E_LAMP);
+  const pool = ctx.createRadialGradient(960, 470, 0, 960, 470, 1150);
+  pool.addColorStop(0, `rgba(43,33,25,${lamp})`); pool.addColorStop(0.55, `rgba(43,33,25,${0.7 * lamp})`); pool.addColorStop(1, 'rgba(43,33,25,0)');
+  ctx.fillStyle = pool; ctx.fillRect(-1200, -1200, 4320, 3480);
+
+  // Plugin rises 30 px into the light.
+  const dy = 30 * (1 - prog(t, 0, 0.9, E_RISE));
+  ctx.save(); ctx.translate(0, dy);
+  ctx.globalAlpha = 0.45 + 0.55 * lamp;
+  ctx.drawImage(shadowCv, PL.x - 220, PL.y - 220, PL.w + 440, PL.h + 440);
+  ctx.globalAlpha = 1;
+  ctx.drawImage(staticCv, PL.x, PL.y, PL.w, PL.h);
+
+  const warm = prog(t, 1.0, 1.6, sm);
+  const play = t >= 1.0 && t < STOP;
+  VUS.forEach((v, i) => drawVU(v, read(i ? NEEDLE_R : NEEDLE_L, t), warm));
+  drawDisplay(t, prog(t, 1.0, 1.3, sm), play);
+  drawLadder(LADDERS[0], read(LAD_L, t), read(PK_L, t));
+  drawLadder(LADDERS[1], read(LAD_R, t), read(PK_R, t));
+  for (const [name, k] of Object.entries(KNOBS)) drawKnob(k, knobAngle(name, t));
+
+  const playB = prog(t, 1.0, 1.08) * (1 - prog(t, STOP, STOP + 0.08));
+  led(PLAYBTN.x + PLAYBTN.w / 2, 806, [57, 211, 83], playB, 0);
+  const powered = prog(t, 1.0, 1.2);
+  for (let j = 0; j < 16; j++) {
+    led(STEPS_X(j) + 29, 806, [255, 42, 31], stepLed(j, t), CFG.active.includes(j + 1) ? 0.3 * powered : 0);
+  }
+
+  // Intro sheen across the metal.
+  const sp = prog(t, 0.25, 1.05);
+  if (sp > 0 && sp < 1) {
+    const x = lerp(-300, 2200, E_CAM(sp)), a = Math.sin(Math.PI * sp) * 0.2;
+    ctx.save(); ctx.beginPath(); ctx.rect(FACE.x, FACE.y, FACE.w, FACE.h); ctx.clip();
+    const g = ctx.createLinearGradient(x - 260, 150, x + 140, 930);
+    g.addColorStop(0, 'rgba(255,250,240,0)'); g.addColorStop(0.5, `rgba(255,250,240,${a})`); g.addColorStop(1, 'rgba(255,250,240,0)');
+    ctx.fillStyle = g; ctx.fillRect(FACE.x, FACE.y, FACE.w, FACE.h); ctx.restore();
+  }
+  // Pre-lamp darkness.
+  if (lamp < 1) { ctx.fillStyle = `rgba(12,9,6,${0.62 * (1 - lamp)})`; rrect(ctx, PL.x, PL.y, PL.w, PL.h, 16); ctx.fill(); }
+
+  // Cutoff gesture: cursor, drag, log-scale tooltip.
+  const ca = prog(t, C0, C0 + 0.25) * (1 - prog(t, C0 + 1.8, C0 + 2.3));
+  if (ca > 0) {
+    const mv = prog(t, C0, C0 + 0.5, E_CAM), dr = prog(t, C0 + 0.6, C0 + 1.5, E_KNOB);
+    const x = lerp(930, 806, mv), y = lerp(770, 652, mv) - 110 * dr;
+    const press = prog(t, C0 + 0.5, C0 + 0.58) * (1 - prog(t, C0 + 1.6, C0 + 1.68));
+    const ta = prog(t, C0 + 0.55, C0 + 0.7) * (1 - prog(t, C0 + 1.8, C0 + 2.3));
+    // Parked in the gap between the FILTER title and the Resonance ticks so it covers no control.
+    if (ta > 0) drawTooltip(836, 518, `CUTOFF ${fmtHz(cutoffHz(t))}`, ta);
+    drawCursor(x, y, 1 - 0.07 * press, ca);
+  }
+  ctx.restore();
+}
+
+// Probe for automated QA (read-only view of the same precomputed state).
+window.__probe = t => {
+  t = clamp(t, 0, DUR);
+  return {
+    t, needleL: read(NEEDLE_L, t), needleR: read(NEEDLE_R, t), vuZero: VU_POS(0),
+    ladL: read(LAD_L, t), pkL: read(PK_L, t), cutoffDeg: knobAngle('cutoff', t), cutoffHz: cutoffHz(t),
+    zoom: camera(t).z, playing: t >= 1.0 && t < STOP,
+  };
+};
+window.TIMELINE = { DUR, START, STEP, BAR, BARS, LAST, STOP, C0, P0, P1, P2, OMEGA, ZETA };
+window.DURATION = DUR;
+window.seek = seek;
+seek(0);
+window.__ready = true;
+
+if (!RENDER) {
+  const reduce = window.matchMedia && matchMedia('(prefers-reduced-motion: reduce)').matches;
+  if (reduce) seek(C0 + 1.6);
+  else {
+    let t0 = null;
+    const loop = now => { if (t0 === null) t0 = now; seek(((now - t0) / 1000) % DUR); requestAnimationFrame(loop); };
+    requestAnimationFrame(loop);
+  }
+}
+})();
+</script>
+</body>
+</html>
